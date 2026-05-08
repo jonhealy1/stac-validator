@@ -683,7 +683,7 @@ python server/server.py
 **Running the Server (Docker):**
 ```bash
 # Pull and run the official GitHub container image
-docker run -p 8000:8000 ghcr.io/stac-utils/stac-validator:latest
+docker run -p 8000:8000 ghcr.io/staclabs/stac-validator:latest
 ```
 
 **Validate via local script:**
@@ -695,7 +695,7 @@ python server/test_api.py sample_data/item.json
 ```bash
 curl -X POST http://localhost:8000/validate \
   -H "Content-Type: application/json" \
-  -d @sample_data/item.json
+  -d @sample_data/sentinel-cogs_0_100.json
 ```
 
 **Response Format:**
