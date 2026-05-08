@@ -688,7 +688,7 @@ docker run -p 8000:8000 ghcr.io/staclabs/stac-validator:latest
 
 **Validate via local script:**
 ```bash
-python server/test_api.py sample_data/item.json
+python server/api_client_example.py sample_data/sentinel-cogs_0_100.json
 ```
 
 **Validate via curl:**
