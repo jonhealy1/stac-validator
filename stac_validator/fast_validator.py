@@ -3,7 +3,7 @@ import os
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 import click
 import fastjsonschema  # type: ignore
@@ -110,7 +110,7 @@ def get_validator(stac_type: str, stac_version: str, extensions: List[str]):
         import jsonschema
 
         # Create a validator using the same custom logic
-        def fallback_validator(data):
+        def fallback_validator(data: Dict[str, Any]) -> None:
             # We need a resolver to handle the remote $refs
             resolver = jsonschema.RefResolver(
                 base_uri="",
@@ -200,8 +200,8 @@ class FastValidator:
         valid_count = 0
         invalid_count = 0
         error_registry: Dict[str, List[str]] = {}
-        stac_versions_found: set = set()
-        schemas_checked: set = set()
+        stac_versions_found: Set[str] = set()
+        schemas_checked: Set[str] = set()
 
         for index, item in enumerate(items_to_validate):
             # Determine specific STAC attributes for this object
