@@ -16,6 +16,16 @@ The format is (loosely) based on [Keep a Changelog](http://keepachangelog.com/) 
 
 ### Updated
 
+## [v4.4.0] - 2026-05-11
+
+### Added
+
+- support for --recursive option for `fast` command to validate static STAC catalogs. [#294](https://github.com/stac-utils/stac-validator/pull/294)
+- support for --api option for `fast` command to validate STAC API endpoints. [#294](https://github.com/stac-utils/stac-validator/pull/294)
+- support for --limit option for `fast` command to cap the number of STAC objects validated. [#294](https://github.com/stac-utils/stac-validator/pull/294)
+- Added `run_dict` method to `FastValidator` for direct in-memory dictionary validation without file/network loading. [#294](https://github.com/stac-utils/stac-validator/pull/294)
+
+
 ## [v4.3.0] - 2026-05-08
 
 ### Added
