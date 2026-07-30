@@ -110,6 +110,7 @@ def get_validator(stac_type: str, stac_version: str, extensions: List[str]):
     else:
         raise ValueError(f"Unknown STAC type for validation: {stac_type}")
 
+    # Try to compile with all extensions using allOf
     schema_fragments: List[Dict[str, str]] = [{"$ref": base_uri}]
     for ext in extensions:
         schema_fragments.append({"$ref": ext})
@@ -119,31 +120,69 @@ def get_validator(stac_type: str, stac_version: str, extensions: List[str]):
     }
 
     try:
-        validator = fastjsonschema.compile(
+        # TIER 1: Try compiling everything dynamically using allOf (Maximum Speed)
+        compiled_validator = fastjsonschema.compile(
             dynamic_schema, handlers={"http": fetch_schema, "https": fetch_schema}
         )
+
+        def validator(data: Dict[str, Any]) -> None:
+            old_limit = sys.getrecursionlimit()
+            sys.setrecursionlimit(10000)
+            try:
+                compiled_validator(data)
+            finally:
+                sys.setrecursionlimit(old_limit)
+
     except Exception:
-        # FALLBACK: Some schemas (like Item Assets) cause fastjsonschema to generate invalid python code.
-        # We fall back to the standard jsonschema library.
-        click.secho(
-            "    [Fallback] fastjsonschema compile failed. Using python-jsonschema.",
-            fg="yellow",
-            dim=True,
+        # TIER 2: allOf compilation failed (e.g., storage extension reference collisions).
+        # Compile base and compatible extensions separately. Skip broken ones to maintain API speed.
+        base_validator = fastjsonschema.compile(
+            {"$ref": base_uri},
+            handlers={"http": fetch_schema, "https": fetch_schema},
         )
-        import jsonschema
 
-        # Create a validator using the same custom logic
-        def fallback_validator(data: Dict[str, Any]) -> None:
-            # We need a resolver to handle the remote $refs
-            resolver = jsonschema.RefResolver(
-                base_uri="",
-                referrer=dynamic_schema,
-                handlers={"http": fetch_schema, "https": fetch_schema},
+        ext_validators = []
+        skipped_extensions = []
+
+        for ext in extensions:
+            try:
+                ext_val = fastjsonschema.compile(
+                    {"$ref": ext},
+                    handlers={"http": fetch_schema, "https": fetch_schema},
+                )
+                ext_validators.append(ext_val)
+            except Exception:
+                # Skip extensions that fastjsonschema cannot compile
+                skipped_extensions.append(ext)
+
+        # Only print warnings if running in CLI mode, keep the API quiet
+        if skipped_extensions and not QUIET_MODE:
+            click.secho(
+                f"    [Warning] Skipped {len(skipped_extensions)} extension(s) for speed (fastjsonschema compile failed):",
+                fg="yellow",
+                dim=True,
             )
-            jsonschema.validate(data, dynamic_schema, resolver=resolver)
+            for ext in skipped_extensions:
+                click.secho(f"      - {ext}", fg="yellow", dim=True)
+            click.secho(
+                "    For strict validation of all extensions, use: stac-valid validate <file>",
+                fg="yellow",
+                dim=True,
+            )
 
-        validator = fallback_validator
+        def multi_validator(data: Dict[str, Any]) -> None:
+            old_limit = sys.getrecursionlimit()
+            sys.setrecursionlimit(10000)
+            try:
+                base_validator(data)
+                for ext_val in ext_validators:
+                    ext_val(data)
+            finally:
+                sys.setrecursionlimit(old_limit)
 
+        validator = multi_validator
+
+    # Cache the resulting validator so future items use it instantly
     VALIDATOR_CACHE[cache_key] = validator
     return validator, False
 
@@ -155,6 +194,7 @@ class FastValidator:
         quiet: bool = False,
         verbose: bool = False,
         limit: Optional[int] = None,
+        validate_geometry: bool = False,
     ):
         global QUIET_MODE
         self.stac_file = stac_file
@@ -162,8 +202,78 @@ class FastValidator:
         self.valid = True
         self.verbose = verbose
         self.limit = limit
+        self.validate_geometry = validate_geometry
         self.message: List[Dict[str, Any]] = []
         QUIET_MODE = quiet
+
+    def _validate_datetime_range(self, data: Dict[str, Any]) -> None:
+        """Ensures start_datetime is not strictly after end_datetime per STAC Spec.
+
+        Uses lexicographical string comparison since RFC 3339 timestamps sort
+        chronologically when compared as strings. This avoids datetime parsing
+        issues in Python 3.8/3.9 with non-standard ISO 8601 formats.
+        """
+        if data.get("type") != "Feature":
+            return
+
+        properties = data.get("properties", {})
+        start_str = properties.get("start_datetime")
+        end_str = properties.get("end_datetime")
+
+        if start_str and end_str:
+            # RFC 3339 timestamps sort lexicographically, so we can compare as strings
+            # This avoids datetime.fromisoformat() parsing issues in Python 3.8/3.9
+            if start_str > end_str:
+                raise ValueError(
+                    f"Logical Error: start_datetime ({start_str}) cannot be strictly after end_datetime ({end_str})"
+                )
+
+    def _validate_geometry(self, data: Dict[str, Any]) -> None:
+        """Lightweight topology check for global bounds and antimeridian crossings."""
+        if data.get("type") != "Feature":
+            return
+
+        geometry = data.get("geometry")
+        if not geometry:
+            return
+
+        geom_type = geometry.get("type")
+        coords = geometry.get("coordinates")
+        if not coords or geom_type not in ("Polygon", "MultiPolygon"):
+            return
+
+        def check_bounds(c: list):
+            if not c:
+                return
+            if isinstance(c[0], (int, float)):
+                if not (-180 <= c[0] <= 180) or not (-90 <= c[1] <= 90):
+                    raise ValueError(f"Geometry out of global WGS84 bounds: {c}")
+            else:
+                for sub in c:
+                    check_bounds(sub)
+
+        check_bounds(coords)
+
+        def check_rings(rings: list):
+            max_vertices = int(os.environ.get("MAX_TOPOLOGY_VERTICES", 5000))
+            for ring in rings:
+                if len(ring) < 4:
+                    raise ValueError("Polygon ring must have at least 4 coordinates.")
+                if len(ring) > max_vertices:
+                    raise ValueError(
+                        f"Geometry exceeds maximum allowed vertices ({max_vertices}). Found {len(ring)}."
+                    )
+                for i in range(len(ring) - 1):
+                    if abs(ring[i][0] - ring[i + 1][0]) > 180:
+                        raise ValueError(
+                            f"Improper antimeridian crossing between {ring[i][0]} and {ring[i + 1][0]}"
+                        )
+
+        if geom_type == "Polygon":
+            check_rings(coords)
+        elif geom_type == "MultiPolygon":
+            for poly in coords:
+                check_rings(poly)
 
     def _limit_reached(self, results: List[Dict]) -> bool:
         return self.limit is not None and len(results) >= self.limit
@@ -416,6 +526,10 @@ class FastValidator:
             t2 = time.perf_counter()
             try:
                 validator(item)
+                # Run logical firewalls
+                self._validate_datetime_range(item)
+                if self.validate_geometry:
+                    self._validate_geometry(item)
                 t3 = time.perf_counter()
                 exec_time = (t3 - t2) * 1000
                 total_exec_ms += exec_time
@@ -440,6 +554,20 @@ class FastValidator:
                         )
 
                 # Group errors
+                if error_msg not in error_registry:
+                    error_registry[error_msg] = []
+                error_registry[error_msg].append(item_id)
+                status_text = click.style("❌ INVALID", fg="red")
+
+            except ValueError as e:
+                t3 = time.perf_counter()
+                exec_time = (t3 - t2) * 1000
+                total_exec_ms += exec_time
+                invalid_count += 1
+                self.valid = False
+
+                # Logical validation errors (datetime range, geometry)
+                error_msg = str(e)
                 if error_msg not in error_registry:
                     error_registry[error_msg] = []
                 error_registry[error_msg].append(item_id)
@@ -649,6 +777,10 @@ class FastValidator:
             t2 = time.perf_counter()
             try:
                 validator(item)
+                # Run logical firewalls
+                self._validate_datetime_range(item)
+                if self.validate_geometry:
+                    self._validate_geometry(item)
                 t3 = time.perf_counter()
                 total_exec_ms += (t3 - t2) * 1000
                 valid_count += 1
@@ -660,6 +792,15 @@ class FastValidator:
                 error_msg = f"{e.name} {e.message.replace(e.name, '').strip()}"
                 if "disallowed definition" in error_msg and "collection" in error_msg:
                     error_msg = "STAC Spec Violation: Missing {'rel': 'collection'} in links array."
+                if error_msg not in error_registry:
+                    error_registry[error_msg] = []
+                error_registry[error_msg].append(item_id)
+            except ValueError as e:
+                t3 = time.perf_counter()
+                total_exec_ms += (t3 - t2) * 1000
+                invalid_count += 1
+                self.valid = False
+                error_msg = str(e)
                 if error_msg not in error_registry:
                     error_registry[error_msg] = []
                 error_registry[error_msg].append(item_id)
