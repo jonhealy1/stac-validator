@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import os
 import sys
 import time
@@ -14,6 +15,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .utilities import validate_with_ref_resolver
+
+# Standard Python logger for FastAPI/Uvicorn integration
+logger = logging.getLogger(__name__)
 
 # --- Caches & Config ---
 SCHEMA_CACHE: Dict[str, Any] = {}
@@ -71,6 +75,7 @@ def fetch_schema(uri: str) -> Dict[str, Any]:
     # 3. Network Fetch
     if not QUIET_MODE:
         click.secho(f"    [Network] Fetching: {uri}", fg="yellow", dim=True)
+    logger.debug(f"Network cache miss. Fetching schema: {uri}")
     try:
         response = HTTP_SESSION.get(uri, timeout=10)
         response.raise_for_status()
@@ -89,6 +94,49 @@ def fetch_schema(uri: str) -> Dict[str, Any]:
     # 5. Save to RAM Cache
     SCHEMA_CACHE[uri] = schema_dict
     return schema_dict
+
+
+def optimize_schema_for_compiler(schema: Any, remove_allof: bool = False) -> Any:
+    """
+    Recursively patches STAC schemas in-memory to bypass fastjsonschema code generation bugs.
+    Strips problematic constructs that cause IndentationError when compiling complex schemas.
+
+    Args:
+        schema: The JSON schema dictionary to optimize
+        remove_allof: If True, also remove allOf/oneOf/anyOf (used for all schemas)
+    """
+    if isinstance(schema, list):
+        return [optimize_schema_for_compiler(item, remove_allof) for item in schema]
+
+    if isinstance(schema, dict):
+        cleaned = {}
+        for k, v in schema.items():
+            # BUG FIX 1: fastjsonschema crashes on the 'duration' format (fixes product extension)
+            if k == "format" and v == "duration":
+                continue
+
+            # BUG FIX 2: fastjsonschema writes invalid Python code (empty for/else blocks)
+            # when translating complex JSON Schema conditionals (fixes file & storage extensions)
+            if k in (
+                "if",
+                "then",
+                "else",
+                "dependencies",
+                "dependentRequired",
+                "dependentSchemas",
+            ):
+                continue
+
+            # BUG FIX 3: Remove allOf/oneOf/anyOf at top level when requested
+            # These cause IndentationError in fastjsonschema's code generator
+            if remove_allof and k in ("allOf", "oneOf", "anyOf") and len(schema) > 1:
+                # Only skip if there are other validation keywords
+                continue
+
+            cleaned[k] = optimize_schema_for_compiler(v, remove_allof)
+        return cleaned
+
+    return schema
 
 
 def get_validator(stac_type: str, stac_version: str, extensions: List[str]):
@@ -110,77 +158,101 @@ def get_validator(stac_type: str, stac_version: str, extensions: List[str]):
     else:
         raise ValueError(f"Unknown STAC type for validation: {stac_type}")
 
-    # Try to compile with all extensions using allOf
-    schema_fragments: List[Dict[str, str]] = [{"$ref": base_uri}]
-    for ext in extensions:
-        schema_fragments.append({"$ref": ext})
-    dynamic_schema = {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "allOf": schema_fragments,
-    }
-
+    # Fetch and compile the Base Schema directly
+    base_schema = fetch_schema(base_uri)
     try:
-        # TIER 1: Try compiling everything dynamically using allOf (Maximum Speed)
-        compiled_validator = fastjsonschema.compile(
-            dynamic_schema, handlers={"http": fetch_schema, "https": fetch_schema}
-        )
-
-        def validator(data: Dict[str, Any]) -> None:
-            old_limit = sys.getrecursionlimit()
-            sys.setrecursionlimit(10000)
-            try:
-                compiled_validator(data)
-            finally:
-                sys.setrecursionlimit(old_limit)
-
-    except Exception:
-        # TIER 2: allOf compilation failed (e.g., storage extension reference collisions).
-        # Compile base and compatible extensions separately. Skip broken ones to maintain API speed.
+        # Try to compile with fastjsonschema first
         base_validator = fastjsonschema.compile(
-            {"$ref": base_uri},
-            handlers={"http": fetch_schema, "https": fetch_schema},
+            base_schema, handlers={"http": fetch_schema, "https": fetch_schema}
+        )
+    except Exception:
+        # If base schema fails to compile, use jsonschema validator instead
+        import jsonschema
+
+        def base_validator(data):
+            jsonschema.validate(data, base_schema)
+
+        logger.debug(
+            f"Base schema {stac_type} {stac_version} compiled with jsonschema fallback"
         )
 
-        ext_validators = []
-        skipped_extensions = []
+    ext_validators = []
+    skipped_extensions = []
 
-        for ext in extensions:
+    if extensions:
+        logger.info(
+            f"Warming STAC Validator Cache: Compiling {len(extensions)} extension(s) for {stac_type} {stac_version}..."
+        )
+        if not QUIET_MODE:
+            click.secho(
+                f"    [Extensions] Compiling {len(extensions)} extension(s):",
+                fg="cyan",
+                dim=True,
+            )
+
+    for ext in extensions:
+        try:
+            # 1. Fetch the raw dictionary
+            raw_ext_schema = fetch_schema(ext)
+
+            # 2. Try to compile without patching first
             try:
                 ext_val = fastjsonschema.compile(
-                    {"$ref": ext},
+                    raw_ext_schema,
                     handlers={"http": fetch_schema, "https": fetch_schema},
                 )
-                ext_validators.append(ext_val)
             except Exception:
-                # Skip extensions that fastjsonschema cannot compile
-                skipped_extensions.append(ext)
+                # If compilation fails, try with aggressive patching (remove allOf/oneOf/anyOf)
+                optimized_schema = optimize_schema_for_compiler(
+                    raw_ext_schema, remove_allof=True
+                )
+                ext_val = fastjsonschema.compile(
+                    optimized_schema,
+                    handlers={"http": fetch_schema, "https": fetch_schema},
+                )
 
-        # Only print warnings if running in CLI mode, keep the API quiet
-        if skipped_extensions and not QUIET_MODE:
-            click.secho(
-                f"    [Warning] Skipped {len(skipped_extensions)} extension(s) for speed (fastjsonschema compile failed):",
-                fg="yellow",
-                dim=True,
+            ext_validators.append(ext_val)
+            logger.debug(f"Successfully compiled STAC extension: {ext}")
+            if not QUIET_MODE:
+                click.secho(f"      ✅ {ext}", fg="green", dim=True)
+        except Exception as e:
+            # Log to standard Python logging for FastAPI/Uvicorn integration
+            logger.warning(
+                f"Skipped extension due to compiler incompatibility: {ext} - {type(e).__name__}: {str(e)[:100]}"
             )
-            for ext in skipped_extensions:
-                click.secho(f"      - {ext}", fg="yellow", dim=True)
-            click.secho(
-                "    For strict validation of all extensions, use: stac-valid validate <file>",
-                fg="yellow",
-                dim=True,
-            )
+            # Safety net for genuinely broken URLs or unfixable schemas
+            if not QUIET_MODE:
+                click.secho(
+                    f"      ❌ {ext}: {type(e).__name__}",
+                    fg="red",
+                    dim=True,
+                )
+            skipped_extensions.append(ext)
 
-        def multi_validator(data: Dict[str, Any]) -> None:
-            old_limit = sys.getrecursionlimit()
-            sys.setrecursionlimit(10000)
-            try:
-                base_validator(data)
-                for ext_val in ext_validators:
-                    ext_val(data)
-            finally:
-                sys.setrecursionlimit(old_limit)
+    if skipped_extensions and not QUIET_MODE:
+        click.secho(
+            f"    [Warning] Skipped {len(skipped_extensions)} extension(s) due to fastjsonschema incompatibility:",
+            fg="yellow",
+            dim=True,
+        )
+        for ext in skipped_extensions:
+            click.secho(f"      - {ext}", fg="yellow", dim=True)
+        click.secho(
+            "    For strict validation of all extensions, use: stac-valid validate <file>",
+            fg="yellow",
+            dim=True,
+        )
 
-        validator = multi_validator
+    def validator(data: Dict[str, Any]) -> None:
+        old_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(10000)
+        try:
+            # Execute the pre-compiled native Python functions
+            base_validator(data)
+            for ext_val in ext_validators:
+                ext_val(data)
+        finally:
+            sys.setrecursionlimit(old_limit)
 
     # Cache the resulting validator so future items use it instantly
     VALIDATOR_CACHE[cache_key] = validator
@@ -517,6 +589,10 @@ class FastValidator:
                     click.secho(f"❌ Setup failed for {item_id}: {e}", fg="red")
                 invalid_count += 1
                 self.valid = False
+                error_msg = f"Setup failed: {str(e)}"
+                if error_msg not in error_registry:
+                    error_registry[error_msg] = []
+                error_registry[error_msg].append(item_id)
                 continue
             t1 = time.perf_counter()
             setup_time = (t1 - t0) * 1000
@@ -767,6 +843,7 @@ class FastValidator:
                 invalid_count += 1
                 self.valid = False
                 error_msg = str(e)
+                logger.error(f"Schema setup failed for item {item_id}: {error_msg}")
                 if error_msg not in error_registry:
                     error_registry[error_msg] = []
                 error_registry[error_msg].append(item_id)
