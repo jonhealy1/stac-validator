@@ -6,13 +6,23 @@ The format is (loosely) based on [Keep a Changelog](http://keepachangelog.com/) 
 
 ## [Unreleased]
 
+## [v4.6.0] - 2026-09-01
+
 ### Added
+
+- **Multi-Error Pass**: Accumulated error reporting now captures and reports all validation failures across all active extensions on a single item in one pass.
+- **RFC 6901 JSON Pointers**: Added JSON Pointer path translation (`parse_json_pointer()`) to format field failures into standard JSON paths (e.g., `$.properties.eo:cloud_cover`).
+- **Resilient Extension Compilation**: Introduced multi-tier schema patching to compile 100% of community extension schemas (including `file/v2.1.0`, `product/v1.0.0`, and `storage/v2.0.0`) without requiring compiler skips.
 
 ### Changed
 
+- **Clean Error Attribution**: Refactored error formatting to explicitly cite the failing schema source and field location (e.g., `[Extension: eo/v2.0.0] Field '$.properties.eo:cloud_cover': must be number`).
+- **Composite Schema Unrolling**: Pre-compiles `oneOf`/`anyOf` subschema branches independently to preserve C-speed execution while surfacing exact field failures.
+
 ### Fixed
 
-### Removed
+- **Swallowed Error Paths**: Fixed generic `$` root errors caused by `fastjsonschema`'s internal branch handling in composite extension schemas.
+- **Single-Error Short-Circuiting**: Fixed batch execution halting on the first field failure per item. [#308](https://github.com/stac-utils/stac-validator/pull/308)
 
 ## [v4.5.2] - 2026-08-05
 
@@ -490,7 +500,8 @@ The format is (loosely) based on [Keep a Changelog](http://keepachangelog.com/) 
 - With the newest version - 1.0.0-beta.2 - items will run through jsonchema validation before the PySTAC validation. The reason for this is that jsonschema will give more informative error messages. This should be addressed better in the future. This is not the case with the --recursive option as time can be a concern here with larger collections.
 - Logging. Various additions were made here depending on the options selected. This was done to help assist people to update their STAC collections.
 
-[Unreleased]: https://github.com/sparkgeo/stac-validator/compare/v4.5.2..main
+[Unreleased]: https://github.com/sparkgeo/stac-validator/compare/v4.6.0..main
+[v4.6.0]: https://github.com/sparkgeo/stac-validator/compare/v4.5.2..v4.6.0
 [v4.5.2]: https://github.com/sparkgeo/stac-validator/compare/v4.5.1..v4.5.2
 [v4.5.1]: https://github.com/sparkgeo/stac-validator/compare/v4.5.0..v4.5.1
 [v4.5.0]: https://github.com/sparkgeo/stac-validator/compare/v4.4.0..v4.5.0

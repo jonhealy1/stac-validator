@@ -2,7 +2,9 @@ import io
 import json
 import logging
 import os
-import sys
+import re
+import tempfile
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
@@ -19,16 +21,122 @@ from .utilities import validate_with_ref_resolver
 # Standard Python logger for FastAPI/Uvicorn integration
 logger = logging.getLogger(__name__)
 
-# --- Caches & Config ---
+
+def parse_json_pointer(expr_name: Optional[str]) -> str:
+    """Converts fastjsonschema variable names into clean JSON Pointers.
+
+    Handles both bracket notation (data['properties']['eo:cloud_cover'])
+    and dot notation (data.properties.eo:cloud_cover).
+    """
+    if not expr_name or not isinstance(expr_name, str) or expr_name == "data":
+        return "$"
+    # Bracket notation: data['properties']['eo:cloud_cover']
+    keys = re.findall(r"['\"]([^'\"]*)['\"]", expr_name)
+    if keys:
+        return "$." + ".".join(keys)
+    # Dot notation: data.properties.eo:cloud_cover
+    if expr_name.startswith("data."):
+        return "$." + expr_name[5:]
+    return expr_name
+
+
+class FastSTACValidationError(fastjsonschema.JsonSchemaValueException):
+    """Custom validation exception inheriting from fastjsonschema.JsonSchemaValueException.
+
+    Guarantees backward compatibility for legacy callers catching
+    fastjsonschema.JsonSchemaValueException.
+    """
+
+    def __init__(self, source: str, field_path: str, raw_message: str):
+        self.source = source
+        self.field_path = field_path
+        self.raw_message = raw_message
+        formatted_msg = f"[{source}] Field '{field_path}': {raw_message}"
+
+        # Populate fastjsonschema.JsonSchemaValueException superclass attributes:
+        # self.message -> formatted_msg
+        # self.name    -> field_path
+        super().__init__(
+            message=formatted_msg,
+            value=None,
+            name=field_path,
+            definition=None,
+        )
+
+    def __str__(self) -> str:
+        return f"[{self.source}] Field '{self.field_path}': {self.raw_message}"
+
+
+class FastSTACMultiValidationError(FastSTACValidationError):
+    """Container for all validation errors on a single STAC object.
+
+    Inherits from FastSTACValidationError (and transitively JsonSchemaValueException),
+    allowing legacy exception handlers to catch multi-error failures seamlessly.
+    """
+
+    def __init__(self, errors: List[FastSTACValidationError]):
+        self.errors = errors
+        first_err = (
+            errors[0]
+            if errors
+            else FastSTACValidationError("Base STAC", "$", "Unknown validation error")
+        )
+        super().__init__(first_err.source, first_err.field_path, first_err.raw_message)
+
+    def __str__(self) -> str:
+        err_list_str = "; ".join(str(err) for err in self.errors)
+        return f"Found {len(self.errors)} validation error(s): {err_list_str}"
+
+
+def get_cache_directory() -> str:
+    r"""Determines a writable disk cache directory across environments (Docker, Lambda, CLI).
+
+    Priority:
+    1. STAC_VALIDATOR_CACHE_DIR environment variable (explicit override)
+    2. ~/.cache/stac_validator (standard user cache on Linux/macOS)
+    3. %LOCALAPPDATA%\stac_validator (Windows user cache)
+    4. tempfile.gettempdir()/stac_validator_cache (Docker/Lambda /tmp)
+
+    Returns:
+        Path to writable cache directory (guaranteed to exist or be creatable)
+    """
+    # 1. Respect explicit environment variable if set
+    env_dir = os.environ.get("STAC_VALIDATOR_CACHE_DIR")
+    if env_dir:
+        try:
+            os.makedirs(env_dir, exist_ok=True)
+            logger.debug(f"Using STAC_VALIDATOR_CACHE_DIR: {env_dir}")
+            return env_dir
+        except (OSError, PermissionError) as e:
+            logger.warning(f"Cannot write to STAC_VALIDATOR_CACHE_DIR ({env_dir}): {e}")
+
+    # 2. Try standard user cache directory
+    try:
+        user_cache = os.path.join(os.path.expanduser("~"), ".cache", "stac_validator")
+        os.makedirs(user_cache, exist_ok=True)
+        logger.debug(f"Using user cache directory: {user_cache}")
+        return user_cache
+    except (OSError, PermissionError) as e:
+        logger.debug(f"Cannot write to user cache ({user_cache}): {e}")
+
+    # 3. Fallback to system temp directory
+    temp_cache = os.path.join(tempfile.gettempdir(), "stac_validator_cache")
+    try:
+        os.makedirs(temp_cache, exist_ok=True)
+        logger.debug(f"Falling back to temp cache: {temp_cache}")
+        return temp_cache
+    except (OSError, PermissionError) as e:
+        logger.warning(f"Cannot write to temp cache ({temp_cache}): {e}")
+        # Return temp_cache anyway - fetch_schema will handle write failures gracefully
+        return temp_cache
+
+
+# --- Thread-Safe Caches & Lock ---
 SCHEMA_CACHE: Dict[str, Any] = {}
 VALIDATOR_CACHE: Dict[Any, Any] = {}
-QUIET_MODE: bool = False
-# Store cached schemas inside the repository under local_schemas/.schemas (project-root relative)
-LOCAL_SCHEMA_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "local_schemas",
-    ".schemas",
-)
+CACHE_LOCK = threading.Lock()
+# Dynamically determine writable cache directory across environments
+LOCAL_SCHEMA_DIR = get_cache_directory()
 
 # Shared HTTP session with keep-alive connection pooling and retries for crawler workloads.
 HTTP_SESSION = requests.Session()
@@ -53,12 +161,19 @@ def get_local_path_for_uri(uri: str) -> str:
     return os.path.join(LOCAL_SCHEMA_DIR, safe_filename)
 
 
-def fetch_schema(uri: str) -> Dict[str, Any]:
-    """The Ultimate Handler: RAM -> Disk -> Network -> Disk -> RAM"""
+def fetch_schema(uri: str, quiet: bool = False) -> Dict[str, Any]:
+    """The Ultimate Handler: RAM -> Disk -> Network -> Disk -> RAM
 
-    # 1. RAM Cache
-    if uri in SCHEMA_CACHE:
-        return SCHEMA_CACHE[uri]
+    Thread-safe schema fetching with three-tier caching (RAM -> Disk -> Network).
+
+    Args:
+        uri: Schema URI to fetch
+        quiet: If True, suppress network fetch messages
+    """
+    # 1. RAM Cache (Thread-Safe Check)
+    with CACHE_LOCK:
+        if uri in SCHEMA_CACHE:
+            return SCHEMA_CACHE[uri]
 
     local_path = get_local_path_for_uri(uri)
 
@@ -67,13 +182,14 @@ def fetch_schema(uri: str) -> Dict[str, Any]:
         try:
             with open(local_path, "r") as f:
                 schema_dict = json.load(f)
-                SCHEMA_CACHE[uri] = schema_dict
+                with CACHE_LOCK:
+                    SCHEMA_CACHE[uri] = schema_dict
                 return schema_dict
         except Exception:
             pass  # If corrupted, fallback to network
 
     # 3. Network Fetch
-    if not QUIET_MODE:
+    if not quiet:
         click.secho(f"    [Network] Fetching: {uri}", fg="yellow", dim=True)
     logger.debug(f"Network cache miss. Fetching schema: {uri}")
     try:
@@ -83,40 +199,138 @@ def fetch_schema(uri: str) -> Dict[str, Any]:
     except requests.RequestException as e:
         raise RuntimeError(f"Could not resolve schema: {uri}. Reason: {e}")
 
-    # 4. Save to Disk Cache
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    # 4. Save to Disk Cache (Safeguarded)
+    # Fail gracefully if cache directory is unwritable (e.g., Docker/Lambda)
+    # RAM cache (SCHEMA_CACHE) still functions normally even if disk write fails
     try:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
         with open(local_path, "w") as f:
             json.dump(schema_dict, f)
-    except IOError:
-        pass  # If we can't write to disk, no big deal, keep going
+    except (IOError, OSError, PermissionError):
+        # If we can't write to disk, no big deal - keep going with RAM cache
+        pass
 
-    # 5. Save to RAM Cache
-    SCHEMA_CACHE[uri] = schema_dict
+    # 5. Save to RAM Cache (Thread-Safe Store)
+    with CACHE_LOCK:
+        SCHEMA_CACHE[uri] = schema_dict
     return schema_dict
 
 
-def optimize_schema_for_compiler(schema: Any, remove_allof: bool = False) -> Any:
+def compile_unrolled_schema(schema_dict: Dict[str, Any], quiet: bool = False) -> Any:
+    """Unrolls top-level oneOf/anyOf branches into separate compiled fastjsonschema functions
+    so field-level errors are never swallowed by branch exception handling.
+
+    Returns a validator function that tries each branch independently and reports
+    the deepest error found (most specific field path).
+
+    Args:
+        schema_dict: The schema to compile
+        quiet: If True, suppress network fetch messages
     """
-    Recursively patches STAC schemas in-memory to bypass fastjsonschema code generation bugs.
-    Strips problematic constructs that cause IndentationError when compiling complex schemas.
+
+    def handler(u: str) -> Dict[str, Any]:
+        return fetch_schema(u, quiet=quiet)
+
+    handlers_dict = {"http": handler, "https": handler}
+
+    if "oneOf" in schema_dict or "anyOf" in schema_dict:
+        keyword = "oneOf" if "oneOf" in schema_dict else "anyOf"
+        branches = schema_dict[keyword]
+        base_meta = {
+            k: v for k, v in schema_dict.items() if k not in ("oneOf", "anyOf")
+        }
+
+        compiled_branches = []
+        for branch in branches:
+            merged = {**base_meta, **branch}
+            try:
+                # Tier 1: Standard optimization (keeps oneOf/allOf)
+                opt = optimize_schema_for_compiler(merged, remove_allof=False)
+                val = fastjsonschema.compile(opt, handlers=handlers_dict)
+                compiled_branches.append(val)
+            except Exception:
+                try:
+                    # Tier 2: Aggressive optimization (strips oneOf/allOf)
+                    opt = optimize_schema_for_compiler(merged, remove_allof=True)
+                    val = fastjsonschema.compile(opt, handlers=handlers_dict)
+                    compiled_branches.append(val)
+                except Exception:
+                    pass
+
+        if compiled_branches:
+
+            def branch_validator(data: Dict[str, Any]) -> None:
+                best_err = None
+                max_depth = -1
+
+                for val in compiled_branches:
+                    try:
+                        val(data)
+                        return
+                    except fastjsonschema.JsonSchemaValueException as err:
+                        # Split on both brackets and dots to calculate true path depth
+                        depth = len(re.split(r"[\[\.]", err.name))
+                        if depth > max_depth:
+                            max_depth = depth
+                            best_err = err
+
+                if best_err:
+                    raise best_err
+
+            return branch_validator
+
+    opt = optimize_schema_for_compiler(schema_dict, remove_allof=False)
+    return fastjsonschema.compile(opt, handlers=handlers_dict)
+
+
+def optimize_schema_for_compiler(
+    schema: Any,
+    remove_allof: bool = False,
+    depth: int = 0,
+    in_shared_props: bool = False,
+) -> Any:
+    """Recursively patches STAC schemas in-memory to bypass fastjsonschema code generation bugs.
+
+    Strips problematic constructs (like duration formats or dangling conditionals) and prunes
+    empty subschemas ({}) that cause CPython IndentationErrors during compilation.
+
+    Scopes additionalProperties stripping exclusively to the top-level shared Item/Collection
+    properties block so nested object strictness is preserved.
 
     Args:
         schema: The JSON schema dictionary to optimize
-        remove_allof: If True, also remove allOf/oneOf/anyOf (used for all schemas)
+        remove_allof: If True, also remove allOf/oneOf/anyOf (used for aggressive patching)
+        depth: Current recursion depth (0 = root)
+        in_shared_props: True if we are inside the top-level shared properties block
     """
     if isinstance(schema, list):
-        return [optimize_schema_for_compiler(item, remove_allof) for item in schema]
+        cleaned_list = []
+        for item in schema:
+            opt_item = optimize_schema_for_compiler(
+                item, remove_allof, depth + 1, in_shared_props
+            )
+            # Omit empty dictionaries inside composition lists (allOf, oneOf, anyOf)
+            if isinstance(opt_item, dict) and not opt_item:
+                continue
+            cleaned_list.append(opt_item)
+        return cleaned_list
 
     if isinstance(schema, dict):
         cleaned = {}
         for k, v in schema.items():
-            # BUG FIX 1: fastjsonschema crashes on the 'duration' format (fixes product extension)
+            # BUG FIX 1: fastjsonschema crashes on the 'duration' format
             if k == "format" and v == "duration":
                 continue
 
-            # BUG FIX 2: fastjsonschema writes invalid Python code (empty for/else blocks)
-            # when translating complex JSON Schema conditionals (fixes file & storage extensions)
+            # BUG FIX 2: Scoped additionalProperties/unevaluatedProperties removal
+            # Strip these flags ONLY when inside the shared STAC properties map.
+            # This enables multi-extension composition while preserving strict validation
+            # on nested objects (assets, bands, classification:classes, etc.).
+            if k in ("additionalProperties", "unevaluatedProperties") and v is False:
+                if in_shared_props:
+                    continue
+
+            # BUG FIX 3: Conditionals & dependencies that produce empty Python code blocks
             if k in (
                 "if",
                 "then",
@@ -124,28 +338,74 @@ def optimize_schema_for_compiler(schema: Any, remove_allof: bool = False) -> Any
                 "dependencies",
                 "dependentRequired",
                 "dependentSchemas",
+                "$comment",
             ):
                 continue
 
-            # BUG FIX 3: Remove allOf/oneOf/anyOf at top level when requested
-            # These cause IndentationError in fastjsonschema's code generator
+            # BUG FIX 4: Remove allOf/oneOf/anyOf at top level when requested
             if remove_allof and k in ("allOf", "oneOf", "anyOf") and len(schema) > 1:
-                # Only skip if there are other validation keywords
                 continue
 
-            cleaned[k] = optimize_schema_for_compiler(v, remove_allof)
+            # Set in_shared_props=True ONLY when entering the top-level STAC "properties" object
+            # (depth == 1 means we're at the root's direct children, so "properties" at depth 1 is the shared STAC properties)
+            is_props_block = k == "properties" and depth == 1
+            opt_v = optimize_schema_for_compiler(
+                v, remove_allof, depth + 1, in_shared_props or is_props_block
+            )
+
+            # BUG FIX 5: Prune empty subschemas ({}) in properties & patternProperties
+            # to prevent fastjsonschema from generating empty for/else blocks
+            if k in ("patternProperties", "properties", "dependentSchemas"):
+                if isinstance(opt_v, dict):
+                    non_empty_props = {
+                        pk: pv
+                        for pk, pv in opt_v.items()
+                        if not (isinstance(pv, dict) and not pv)
+                    }
+                    if not non_empty_props:
+                        continue
+                    opt_v = non_empty_props
+
+            if k in ("items", "additionalProperties", "unevaluatedProperties"):
+                if isinstance(opt_v, dict) and not opt_v:
+                    continue
+
+            cleaned[k] = opt_v
+
+        # Clean up empty composition keyword arrays
+        for comp_key in ("allOf", "oneOf", "anyOf"):
+            if (
+                comp_key in cleaned
+                and isinstance(cleaned[comp_key], list)
+                and not cleaned[comp_key]
+            ):
+                del cleaned[comp_key]
+
         return cleaned
 
     return schema
 
 
-def get_validator(stac_type: str, stac_version: str, extensions: List[str]):
-    """Builds and caches a validator based on Object Type, Version, and Extensions."""
+def get_validator(
+    stac_type: str, stac_version: str, extensions: List[str], quiet: bool = False
+):
+    """Builds and caches a validator based on Object Type, Version, and Extensions.
+
+    Thread-safe validator compilation and caching.
+
+    Args:
+        stac_type: STAC object type (item, collection, catalog)
+        stac_version: STAC version (e.g., "1.0.0")
+        extensions: List of extension URIs
+        quiet: If True, suppress network fetch and compilation messages
+    """
     ext_key = tuple(sorted(extensions))
     cache_key = (stac_type, stac_version, ext_key)
 
-    if cache_key in VALIDATOR_CACHE:
-        return VALIDATOR_CACHE[cache_key], True
+    # Thread-safe Cache Read
+    with CACHE_LOCK:
+        if cache_key in VALIDATOR_CACHE:
+            return VALIDATOR_CACHE[cache_key], True
 
     # Determine base schema URI
     stac_type_lower = stac_type.lower()
@@ -159,16 +419,18 @@ def get_validator(stac_type: str, stac_version: str, extensions: List[str]):
         raise ValueError(f"Unknown STAC type for validation: {stac_type}")
 
     # Fetch the raw Base Schema directly
-    raw_base_schema = fetch_schema(base_uri)
+    raw_base_schema = fetch_schema(base_uri, quiet=quiet)
+
+    def handler(u: str) -> Dict[str, Any]:
+        return fetch_schema(u, quiet=quiet)
+
+    handlers_dict = {"http": handler, "https": handler}
 
     try:
-        # Tier 1: Try to compile with standard patching first
-        optimized_base = optimize_schema_for_compiler(raw_base_schema)
-        base_validator = fastjsonschema.compile(
-            optimized_base, handlers={"http": fetch_schema, "https": fetch_schema}
-        )
+        # Tier 1: Try to compile with unrolled oneOf/anyOf branches first
+        base_validator = compile_unrolled_schema(raw_base_schema, quiet=quiet)
         logger.debug(
-            f"Base schema {stac_type} {stac_version} compiled with fastjsonschema"
+            f"Base schema {stac_type} {stac_version} compiled with unrolled branch compilation"
         )
     except Exception:
         try:
@@ -177,7 +439,7 @@ def get_validator(stac_type: str, stac_version: str, extensions: List[str]):
                 raw_base_schema, remove_allof=True
             )
             base_validator = fastjsonschema.compile(
-                optimized_base, handlers={"http": fetch_schema, "https": fetch_schema}
+                optimized_base, handlers=handlers_dict
             )
             logger.debug(
                 f"Base schema {stac_type} {stac_version} compiled with fastjsonschema (aggressive patching)"
@@ -191,7 +453,7 @@ def get_validator(stac_type: str, stac_version: str, extensions: List[str]):
             resolver = jsonschema.RefResolver(
                 base_uri=base_uri,
                 referrer=raw_base_schema,
-                handlers={"http": fetch_schema, "https": fetch_schema},
+                handlers=handlers_dict,
             )
             ValidatorClass = jsonschema.validators.validator_for(raw_base_schema)
 
@@ -205,14 +467,14 @@ def get_validator(stac_type: str, stac_version: str, extensions: List[str]):
                 f"Base schema {stac_type} {stac_version} compiled with cached jsonschema fallback"
             )
 
-    ext_validators = []
+    ext_validators: List[Tuple[str, Any, Any]] = []
     skipped_extensions = []
 
     if extensions:
         logger.info(
             f"Warming STAC Validator Cache: Compiling {len(extensions)} extension(s) for {stac_type} {stac_version}..."
         )
-        if not QUIET_MODE:
+        if not quiet:
             click.secho(
                 f"    [Extensions] Compiling {len(extensions)} extension(s):",
                 fg="cyan",
@@ -221,44 +483,58 @@ def get_validator(stac_type: str, stac_version: str, extensions: List[str]):
 
     for ext in extensions:
         try:
-            # 1. Fetch the raw dictionary
-            raw_ext_schema = fetch_schema(ext)
+            raw_ext_schema = fetch_schema(ext, quiet=quiet)
 
-            # 2. Try to compile without patching first
+            # 1. Primary validator compilation with graceful fallback
+            ext_val = None
             try:
+                # Tier 1a: Raw unpatched schema
                 ext_val = fastjsonschema.compile(
                     raw_ext_schema,
-                    handlers={"http": fetch_schema, "https": fetch_schema},
+                    handlers=handlers_dict,
                 )
             except Exception:
-                # If compilation fails, try with aggressive patching (remove allOf/oneOf/anyOf)
-                optimized_schema = optimize_schema_for_compiler(
-                    raw_ext_schema, remove_allof=True
-                )
-                ext_val = fastjsonschema.compile(
-                    optimized_schema,
-                    handlers={"http": fetch_schema, "https": fetch_schema},
-                )
+                try:
+                    # Tier 1b: Standard optimization (strips duration format, if/then/else, keeps oneOf/allOf)
+                    opt_schema = optimize_schema_for_compiler(
+                        raw_ext_schema, remove_allof=False
+                    )
+                    ext_val = fastjsonschema.compile(
+                        opt_schema,
+                        handlers=handlers_dict,
+                    )
+                except Exception:
+                    # Tier 1c: Aggressive optimization (strips top-level allOf/oneOf as last resort)
+                    opt_schema_aggr = optimize_schema_for_compiler(
+                        raw_ext_schema, remove_allof=True
+                    )
+                    ext_val = fastjsonschema.compile(
+                        opt_schema_aggr,
+                        handlers=handlers_dict,
+                    )
 
-            ext_validators.append(ext_val)
+            # 2. Pre-compile unrolled branch validator as a lazy diagnostic backup
+            branch_val = None
+            if "oneOf" in raw_ext_schema or "anyOf" in raw_ext_schema:
+                try:
+                    branch_val = compile_unrolled_schema(raw_ext_schema, quiet=quiet)
+                except Exception:
+                    pass
+
+            ext_validators.append((ext, ext_val, branch_val))
             logger.debug(f"Successfully compiled STAC extension: {ext}")
-            if not QUIET_MODE:
+            if not quiet:
                 click.secho(f"      ✅ {ext}", fg="green", dim=True)
+
         except Exception as e:
-            # Log to standard Python logging for FastAPI/Uvicorn integration
             logger.warning(
                 f"Skipped extension due to compiler incompatibility: {ext} - {type(e).__name__}: {str(e)[:100]}"
             )
-            # Safety net for genuinely broken URLs or unfixable schemas
-            if not QUIET_MODE:
-                click.secho(
-                    f"      ❌ {ext}: {type(e).__name__}",
-                    fg="red",
-                    dim=True,
-                )
+            if not quiet:
+                click.secho(f"      ❌ {ext}: {type(e).__name__}", fg="red", dim=True)
             skipped_extensions.append(ext)
 
-    if skipped_extensions and not QUIET_MODE:
+    if skipped_extensions and not quiet:
         click.secho(
             f"    [Warning] Skipped {len(skipped_extensions)} extension(s) due to fastjsonschema incompatibility:",
             fg="yellow",
@@ -273,18 +549,45 @@ def get_validator(stac_type: str, stac_version: str, extensions: List[str]):
         )
 
     def validator(data: Dict[str, Any]) -> None:
-        old_limit = sys.getrecursionlimit()
-        sys.setrecursionlimit(10000)
-        try:
-            # Execute the pre-compiled native Python functions
-            base_validator(data)
-            for ext_val in ext_validators:
-                ext_val(data)
-        finally:
-            sys.setrecursionlimit(old_limit)
+        collected_errors: List[FastSTACValidationError] = []
 
-    # Cache the resulting validator so future items use it instantly
-    VALIDATOR_CACHE[cache_key] = validator
+        # 1. Base STAC Schema
+        try:
+            base_validator(data)
+        except fastjsonschema.JsonSchemaValueException as e:
+            clean_path = parse_json_pointer(e.name)
+            msg = e.message.replace(e.name, "").strip()
+            collected_errors.append(
+                FastSTACValidationError(f"Base {stac_type}", clean_path, msg)
+            )
+
+        # 2. Individual Extension Schemas (evaluate ALL extensions)
+        for ext_uri, ext_val, branch_val in ext_validators:
+            try:
+                ext_val(data)
+            except fastjsonschema.JsonSchemaValueException as e:
+                clean_path = parse_json_pointer(e.name)
+                msg = e.message.replace(e.name, "").strip()
+
+                # Unmask swallowed oneOf paths ($) using our diagnostic branch helper
+                if clean_path == "$" and branch_val is not None:
+                    try:
+                        branch_val(data)
+                    except fastjsonschema.JsonSchemaValueException as branch_e:
+                        clean_path = parse_json_pointer(branch_e.name)
+                        msg = branch_e.message.replace(branch_e.name, "").strip()
+
+                collected_errors.append(
+                    FastSTACValidationError(f"Extension: {ext_uri}", clean_path, msg)
+                )
+
+        # Raise all accumulated errors at the end of the item pass
+        if collected_errors:
+            raise FastSTACMultiValidationError(collected_errors)
+
+    # Cache the resulting validator so future items use it instantly (Thread-safe Write)
+    with CACHE_LOCK:
+        VALIDATOR_CACHE[cache_key] = validator
     return validator, False
 
 
@@ -297,7 +600,6 @@ class FastValidator:
         limit: Optional[int] = None,
         validate_geometry: bool = False,
     ):
-        global QUIET_MODE
         self.stac_file = stac_file
         self.quiet = quiet
         self.valid = True
@@ -305,7 +607,6 @@ class FastValidator:
         self.limit = limit
         self.validate_geometry = validate_geometry
         self.message: List[Dict[str, Any]] = []
-        QUIET_MODE = quiet
 
     def _validate_datetime_range(self, data: Dict[str, Any]) -> None:
         """Ensures start_datetime is not strictly after end_datetime per STAC Spec.
@@ -511,6 +812,101 @@ class FastValidator:
             ]
             return [future.result() for future in futures]
 
+    def _validate_single_item(
+        self, item: Dict[str, Any], item_index: int
+    ) -> Tuple[bool, float, float, str, List[str]]:
+        """Validate a single STAC item and return (is_valid, setup_ms, exec_ms, item_id, error_messages).
+
+        This helper eliminates code duplication between run() and run_dict() by providing
+        a unified validation pipeline for individual items.
+
+        Returns:
+            Tuple of (is_valid, setup_time_ms, exec_time_ms, item_id, error_messages)
+        """
+        item_id = item.get("id", f"unknown-{item_index}")
+        stac_version = item.get("stac_version", "1.0.0")
+        extensions = item.get("stac_extensions", [])
+
+        # Map Feature->Item, others keep their type
+        actual_type = (
+            "Item" if item.get("type") == "Feature" else item.get("type", "Catalog")
+        )
+
+        # --- Setup Timer ---
+        t0 = time.perf_counter()
+        try:
+            validator, _ = get_validator(
+                actual_type, stac_version, extensions, quiet=self.quiet
+            )
+        except Exception as e:
+            t1 = time.perf_counter()
+            setup_time = (t1 - t0) * 1000
+            error_msg = f"Setup failed: {str(e)}"
+            return False, setup_time, 0.0, item_id, [error_msg]
+
+        t1 = time.perf_counter()
+        setup_time = (t1 - t0) * 1000
+
+        # --- Execution Timer ---
+        t2 = time.perf_counter()
+        error_messages: List[str] = []
+
+        try:
+            validator(item)
+            # Run logical firewalls
+            self._validate_datetime_range(item)
+            if self.validate_geometry:
+                self._validate_geometry(item)
+            t3 = time.perf_counter()
+            exec_time = (t3 - t2) * 1000
+            return True, setup_time, exec_time, item_id, error_messages
+
+        except FastSTACMultiValidationError as e:
+            t3 = time.perf_counter()
+            exec_time = (t3 - t2) * 1000
+            error_messages = [str(single_err) for single_err in e.errors]
+            return False, setup_time, exec_time, item_id, error_messages
+
+        except FastSTACValidationError as e:
+            t3 = time.perf_counter()
+            exec_time = (t3 - t2) * 1000
+            error_messages = [str(e)]
+            return False, setup_time, exec_time, item_id, error_messages
+
+        except fastjsonschema.JsonSchemaValueException as e:
+            t3 = time.perf_counter()
+            exec_time = (t3 - t2) * 1000
+            error_msg = f"{e.name} {e.message.replace(e.name, '').strip()}"
+            if "disallowed definition" in error_msg and "collection" in error_msg:
+                error_msg = (
+                    "STAC Spec Violation: Missing {'rel': 'collection'} in links array."
+                )
+            error_messages = [error_msg]
+            return False, setup_time, exec_time, item_id, error_messages
+
+        except ValueError as e:
+            t3 = time.perf_counter()
+            exec_time = (t3 - t2) * 1000
+            error_messages = [str(e)]
+            return False, setup_time, exec_time, item_id, error_messages
+
+        except Exception as e:
+            t3 = time.perf_counter()
+            exec_time = (t3 - t2) * 1000
+
+            if self._is_ref_resolution_error(e):
+                try:
+                    self._validate_with_jsonschema_fallback(
+                        item, actual_type, stac_version, extensions
+                    )
+                    return True, setup_time, exec_time, item_id, error_messages
+                except Exception as fallback_err:
+                    error_messages = [str(fallback_err)]
+                    return False, setup_time, exec_time, item_id, error_messages
+            else:
+                error_messages = [str(e)]
+                return False, setup_time, exec_time, item_id, error_messages
+
     def run(self):
         """Universal high-speed STAC Validator (Items, Collections, Catalogs, FeatureCollections)"""
         if not self.quiet:
@@ -581,18 +977,19 @@ class FastValidator:
         schemas_checked: Set[str] = set()
 
         for index, item in enumerate(items_to_validate):
-            # Determine specific STAC attributes for this object
-            item_id = item.get("id", f"unknown-{index}")
-            stac_version = item.get("stac_version", "1.0.0")
-            extensions = item.get("stac_extensions", [])
+            # Use unified validation helper
+            is_valid, setup_time, exec_time, item_id, error_messages = (
+                self._validate_single_item(item, index)
+            )
 
             # Track versions and schemas
-            stac_versions_found.add(stac_version)
-
-            # Map Feature->Item, others keep their type
+            stac_version = item.get("stac_version", "1.0.0")
+            extensions = item.get("stac_extensions", [])
             actual_type = (
                 "Item" if item.get("type") == "Feature" else item.get("type", "Catalog")
             )
+
+            stac_versions_found.add(stac_version)
 
             # Build schema URI for this object type
             try:
@@ -607,114 +1004,28 @@ class FastValidator:
             for ext in extensions:
                 schemas_checked.add(ext)
 
-            # --- Setup Timer ---
-            t0 = time.perf_counter()
-            try:
-                validator, is_cached = get_validator(
-                    actual_type, stac_version, extensions
-                )
-            except Exception as e:
-                if not self.quiet:
-                    click.secho(f"❌ Setup failed for {item_id}: {e}", fg="red")
-                invalid_count += 1
-                self.valid = False
-                error_msg = f"Setup failed: {str(e)}"
-                if error_msg not in error_registry:
-                    error_registry[error_msg] = []
-                error_registry[error_msg].append(item_id)
-                continue
-            t1 = time.perf_counter()
-            setup_time = (t1 - t0) * 1000
+            # Accumulate metrics
             total_setup_ms += setup_time
+            total_exec_ms += exec_time
 
-            # --- Execution Timer ---
-            t2 = time.perf_counter()
-            try:
-                validator(item)
-                # Run logical firewalls
-                self._validate_datetime_range(item)
-                if self.validate_geometry:
-                    self._validate_geometry(item)
-                t3 = time.perf_counter()
-                exec_time = (t3 - t2) * 1000
-                total_exec_ms += exec_time
+            if is_valid:
                 valid_count += 1
                 status_text = click.style("✅ VALID", fg="green")
-
-            except fastjsonschema.JsonSchemaValueException as e:
-                t3 = time.perf_counter()
-                exec_time = (t3 - t2) * 1000
-                total_exec_ms += exec_time
+            else:
                 invalid_count += 1
                 self.valid = False
-
-                # --- The STAC Error Translator ---
-                error_msg = f"{e.name} {e.message.replace(e.name, '').strip()}"
-                if "disallowed definition" in error_msg:
-                    if "collection" in error_msg:
-                        error_msg = "STAC Spec Violation: Missing {'rel': 'collection'} in links array."
-                    else:
-                        error_msg = (
-                            f"{e.name} violated a 'not' rule. Value: {repr(e.value)}"
-                        )
-
-                # Group errors
-                if error_msg not in error_registry:
-                    error_registry[error_msg] = []
-                error_registry[error_msg].append(item_id)
                 status_text = click.style("❌ INVALID", fg="red")
-
-            except ValueError as e:
-                t3 = time.perf_counter()
-                exec_time = (t3 - t2) * 1000
-                total_exec_ms += exec_time
-                invalid_count += 1
-                self.valid = False
-
-                # Logical validation errors (datetime range, geometry)
-                error_msg = str(e)
-                if error_msg not in error_registry:
-                    error_registry[error_msg] = []
-                error_registry[error_msg].append(item_id)
-                status_text = click.style("❌ INVALID", fg="red")
-
-            except Exception as e:
-                t3 = time.perf_counter()
-                exec_time = (t3 - t2) * 1000
-                total_exec_ms += exec_time
-
-                if self._is_ref_resolution_error(e):
-                    try:
-                        self._validate_with_jsonschema_fallback(
-                            item,
-                            actual_type,
-                            stac_version,
-                            extensions,
-                        )
-                        valid_count += 1
-                        status_text = click.style("✅ VALID", fg="green")
-                    except Exception as fallback_err:
-                        invalid_count += 1
-                        self.valid = False
-                        error_msg = str(fallback_err)
-                        if error_msg not in error_registry:
-                            error_registry[error_msg] = []
-                        error_registry[error_msg].append(item_id)
-                        status_text = click.style("❌ INVALID", fg="red")
-                else:
-                    invalid_count += 1
-                    self.valid = False
-                    error_msg = str(e)
+                # Register all errors for this item
+                for error_msg in error_messages:
                     if error_msg not in error_registry:
                         error_registry[error_msg] = []
                     error_registry[error_msg].append(item_id)
-                    status_text = click.style("❌ INVALID", fg="red")
 
             if not self.quiet:
                 if self.verbose or index < 5 or (len(items_to_validate) < 20):
-                    cache_icon = "⚡" if is_cached else "🐌"
+                    # Note: is_cached info is not available from helper, use placeholder
                     click.echo(
-                        f"[{index + 1}] ID: {item_id} | Type: {actual_type} | Cache {cache_icon} | Setup: {setup_time:>6.2f}ms | Exec: {exec_time:>5.2f}ms | {status_text}"
+                        f"[{index + 1}] ID: {item_id} | Type: {actual_type} | Setup: {setup_time:>6.2f}ms | Exec: {exec_time:>5.2f}ms | {status_text}"
                     )
                 elif index == 5:
                     click.secho(
@@ -844,15 +1155,19 @@ class FastValidator:
         self.valid = True
 
         for index, item in enumerate(items_to_validate):
-            item_id = item.get("id", f"unknown-{index}")
+            # Use unified validation helper
+            is_valid, setup_time, exec_time, item_id, error_messages = (
+                self._validate_single_item(item, index)
+            )
+
+            # Track versions and schemas
             stac_version = item.get("stac_version", "1.0.0")
             extensions = item.get("stac_extensions", [])
-
-            stac_versions_found.add(stac_version)
-
             actual_type = (
                 "Item" if item.get("type") == "Feature" else item.get("type", "Catalog")
             )
+
+            stac_versions_found.add(stac_version)
 
             try:
                 base_schema = self._get_base_schema_uri(actual_type, stac_version)
@@ -865,74 +1180,17 @@ class FastValidator:
             for ext in extensions:
                 schemas_checked.add(ext)
 
-            t0 = time.perf_counter()
-            try:
-                validator, _ = get_validator(actual_type, stac_version, extensions)
-            except Exception as e:
-                invalid_count += 1
-                self.valid = False
-                error_msg = str(e)
-                logger.error(f"Schema setup failed for item {item_id}: {error_msg}")
-                if error_msg not in error_registry:
-                    error_registry[error_msg] = []
-                error_registry[error_msg].append(item_id)
-                continue
-            t1 = time.perf_counter()
-            total_setup_ms += (t1 - t0) * 1000
+            # Accumulate metrics
+            total_setup_ms += setup_time
+            total_exec_ms += exec_time
 
-            t2 = time.perf_counter()
-            try:
-                validator(item)
-                # Run logical firewalls
-                self._validate_datetime_range(item)
-                if self.validate_geometry:
-                    self._validate_geometry(item)
-                t3 = time.perf_counter()
-                total_exec_ms += (t3 - t2) * 1000
+            if is_valid:
                 valid_count += 1
-            except fastjsonschema.JsonSchemaValueException as e:
-                t3 = time.perf_counter()
-                total_exec_ms += (t3 - t2) * 1000
+            else:
                 invalid_count += 1
                 self.valid = False
-                error_msg = f"{e.name} {e.message.replace(e.name, '').strip()}"
-                if "disallowed definition" in error_msg and "collection" in error_msg:
-                    error_msg = "STAC Spec Violation: Missing {'rel': 'collection'} in links array."
-                if error_msg not in error_registry:
-                    error_registry[error_msg] = []
-                error_registry[error_msg].append(item_id)
-            except ValueError as e:
-                t3 = time.perf_counter()
-                total_exec_ms += (t3 - t2) * 1000
-                invalid_count += 1
-                self.valid = False
-                error_msg = str(e)
-                if error_msg not in error_registry:
-                    error_registry[error_msg] = []
-                error_registry[error_msg].append(item_id)
-            except Exception as e:
-                t3 = time.perf_counter()
-                total_exec_ms += (t3 - t2) * 1000
-                if self._is_ref_resolution_error(e):
-                    try:
-                        self._validate_with_jsonschema_fallback(
-                            item,
-                            actual_type,
-                            stac_version,
-                            extensions,
-                        )
-                        valid_count += 1
-                    except Exception as fallback_err:
-                        invalid_count += 1
-                        self.valid = False
-                        error_msg = str(fallback_err)
-                        if error_msg not in error_registry:
-                            error_registry[error_msg] = []
-                        error_registry[error_msg].append(item_id)
-                else:
-                    invalid_count += 1
-                    self.valid = False
-                    error_msg = str(e)
+                # Register all errors for this item
+                for error_msg in error_messages:
                     if error_msg not in error_registry:
                         error_registry[error_msg] = []
                     error_registry[error_msg].append(item_id)
@@ -962,7 +1220,6 @@ class FastValidator:
 
     def run_recursive(self):
         """Recursively validate a local STAC catalog/collection and all its children."""
-        sys.setrecursionlimit(10000)
         start_time = time.perf_counter()
 
         # Load the root STAC object
@@ -982,7 +1239,9 @@ class FastValidator:
         results = []
         visited = set()
         visited.add(root_path)
-        self._validate_recursive(root_data, root_path, results, visited, is_api=False)
+        self._validate_recursive(
+            root_data, root_path, results, visited, is_api=False, depth=0
+        )
 
         if self.limit is not None and not self.quiet and len(results) >= self.limit:
             click.secho(
@@ -1042,7 +1301,6 @@ class FastValidator:
 
     def run_api(self):
         """Recursively validate a STAC API catalog and all its collections/items."""
-        sys.setrecursionlimit(10000)
         start_time = time.perf_counter()
 
         if not self.quiet:
@@ -1077,7 +1335,9 @@ class FastValidator:
                 dim=True,
             )
 
-        self._validate_recursive(root_data, root_path, results, visited, is_api=True)
+        self._validate_recursive(
+            root_data, root_path, results, visited, is_api=True, depth=0
+        )
 
         if self.limit is not None and not self.quiet and len(results) >= self.limit:
             click.secho(
@@ -1144,6 +1404,7 @@ class FastValidator:
         is_api: bool = False,
         collection_id: Optional[str] = None,
         prefetched_resources: Optional[Dict[str, Dict[str, Any]]] = None,
+        depth: int = 0,
     ):
         """Recursively validate a STAC object and its children.
 
@@ -1154,7 +1415,20 @@ class FastValidator:
             visited: Set of already-visited paths to prevent circular references
             is_api: If True, follow API-specific links (data, items, next); if False, follow catalog links (child, item)
             collection_id: Optional collection ID for items from FeatureCollections
+            depth: Current recursion depth (0 at root)
         """
+        # Protect against deeply nested catalog structures
+        MAX_RECURSION_DEPTH = 250
+        if depth > MAX_RECURSION_DEPTH:
+            results.append(
+                {
+                    "path": file_path,
+                    "valid_stac": False,
+                    "error_message": f"Maximum catalog depth ({MAX_RECURSION_DEPTH}) exceeded.",
+                }
+            )
+            return
+
         if self._limit_reached(results):
             return
 
@@ -1203,11 +1477,20 @@ class FastValidator:
 
                 # Mute noisy "[Fallback]" and "[Network]" prints from validation execution path
                 with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                    validator, _ = get_validator(stac_type, stac_version, extensions)
+                    validator, _ = get_validator(
+                        stac_type, stac_version, extensions, quiet=self.quiet
+                    )
                     validator(data)
 
                 is_valid = True
                 error_msg = None
+            except FastSTACMultiValidationError as e:
+                is_valid = False
+                # Aggregate all errors into a single message for display
+                error_msg = "; ".join(str(err) for err in e.errors)
+            except FastSTACValidationError as e:
+                is_valid = False
+                error_msg = str(e)
             except fastjsonschema.JsonSchemaValueException as e:
                 is_valid = False
                 error_msg = f"{e.name} {e.message.replace(e.name, '').strip()}"
@@ -1351,11 +1634,17 @@ class FastValidator:
                                     visited,
                                     is_api,
                                     prefetched_resources=prefetched_collection_resources,
+                                    depth=depth + 1,
                                 )
                         else:
                             # Not a collections list, validate as normal
                             self._validate_recursive(
-                                child_data, child_path, results, visited, is_api
+                                child_data,
+                                child_path,
+                                results,
+                                visited,
+                                is_api,
+                                depth=depth + 1,
                             )
                     # If this is an items endpoint (GeoJSON FeatureCollection), validate only Features
                     elif rel == "items" and is_api and isinstance(child_data, dict):
@@ -1386,11 +1675,17 @@ class FastValidator:
                                     visited,
                                     is_api,
                                     collection_id_from_items,
+                                    depth=depth + 1,
                                 )
                     else:
                         # Recursively validate child
                         self._validate_recursive(
-                            child_data, child_path, results, visited, is_api
+                            child_data,
+                            child_path,
+                            results,
+                            visited,
+                            is_api,
+                            depth=depth + 1,
                         )
                 except Exception as e:
                     if self._limit_reached(results):
